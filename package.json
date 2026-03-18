@@ -1,0 +1,42 @@
+{
+  "name": "pi-autohooks",
+  "version": "0.1.0",
+  "description": "Runs user-defined scripts at pre-tool-use, post-tool-use, and agent-stop (Claude Code–compatible JSON protocol)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YOUR_USERNAME/pi-autohooks.git"
+  },
+  "author": "Your Name",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "main": "extensions/index.ts",
+  "files": [
+    "extensions",
+    "skills",
+    "src",
+    "package.json",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "vitest"
+  },
+"peerDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.56.0",
+    "@sinclair/typebox": "^0.34.48"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  },
+  "pi": {
+    "image": "https://raw.githubusercontent.com/YOUR_USERNAME/pi-autohooks/main/extension-icon.png",
+    "extensions": [
+      "extensions/index.ts"
+    ],
+    "skills": [
+      "skills"
+    ]
+  }
+}
