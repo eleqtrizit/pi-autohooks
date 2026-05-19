@@ -17,7 +17,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { existsSync, readdirSync, statSync, readFileSync } from "fs";
+import { existsSync, readdirSync, statSync, readFileSync, appendFileSync } from "fs";
 import { basename, join } from "path";
 import { homedir } from "os";
 import { spawn } from "child_process";
@@ -597,6 +597,35 @@ ${HOOK_RECIPES}
 Follow the JSON protocol exactly. Do not add unnecessary complexity — keep scripts focused on the described behaviour.`;
 }
 
+// ---------------------------------------------------------------------------
+// Hook execution log
+// ---------------------------------------------------------------------------
+
+const LOG_FILE = join(homedir(), ".pi", "autohooks.log");
+
+/**
+ * Whether hook execution logging is enabled.
+ * Controlled by the ENABLE_HOOK_LOG environment variable.
+ * Set to "1" or "true" to enable.
+ */
+const HOOK_LOG_ENABLED = process.env.ENABLE_HOOK_LOG === "1" || process.env.ENABLE_HOOK_LOG === "true";
+
+/**
+ * Appends a timestamped line to the hook execution log.
+ * No-op unless ENABLE_HOOK_LOG=1 is set.
+ *
+ * @param message - The log message to append
+ */
+function logHook(message: string): void {
+	if (!HOOK_LOG_ENABLED) return;
+	try {
+		const timestamp = new Date().toISOString();
+		appendFileSync(LOG_FILE, `[${timestamp}] ${message}\n`);
+	} catch {
+		// Silently ignore log write failures
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	// Tracks whether the most recent agent run was triggered by an agent-stop hook.
 	// Passed to stop scripts as stop_hook_active so they can avoid infinite loops.
@@ -606,6 +635,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		try {
 			const cwd = ctx.cwd;
+			logHook(`session_start cwd=${cwd}`);
+
 			const settingsHooks = loadSettingsHooks(cwd);
 
 			const lines: string[] = [];
@@ -618,6 +649,7 @@ export default function (pi: ExtensionAPI) {
 					for (const group of groups) {
 						for (const entry of group.hooks) {
 							lines.push(formatHookDisplay(entry, mappedEvent, group.matcher ?? ""));
+							logHook(`  settings hook: ${mappedEvent} matcher=${group.matcher ?? ""} cmd=${(entry.command ?? "").slice(0, 80)}`);
 						}
 					}
 				}
@@ -632,6 +664,7 @@ export default function (pi: ExtensionAPI) {
 						? "." + script.slice(cwd.length)
 						: script.replace(homedir(), "~");
 					dirLines.push(`  • ${piEvent} (script): ${relPath}`);
+					logHook(`  dir hook: ${piEvent} script=${relPath}`);
 				}
 			}
 			if (dirLines.length > 0) {
@@ -641,6 +674,10 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (lines.length > 0) {
+				if (HOOK_LOG_ENABLED) {
+					lines.push("");
+					lines.push("\x1b[41m\x1b[97m⚠ HOOK LOG ENABLED ~/.pi/autohooks.log ⚠\x1b[0m");
+				}
 				ctx.ui.notify(lines.join("\n"), "info");
 			} else {
 				console.log("[hooks-runner] No hooks found in settings.json or directories");
@@ -736,6 +773,8 @@ export default function (pi: ExtensionAPI) {
 
 		if (scripts.length === 0 && settingsHooks.length === 0) return;
 
+		logHook(`pre-tool-use tool=${event.toolName} id=${event.toolCallId} dir_scripts=${scripts.length} settings_hooks=${settingsHooks.length}`);
+
 		const input: PreToolUseInput = {
 			session_id: ctx.sessionManager.getSessionId(),
 			cwd: ctx.cwd,
@@ -747,10 +786,12 @@ export default function (pi: ExtensionAPI) {
 
 		// Run directory-based scripts first
 		for (const script of scripts) {
+			logHook(`pre-tool-use dir script=${basename(script)}`);
 			const result = await runScript(script, input);
 
 			const blockReason = getBlockReason(result);
 			if (blockReason !== null) {
+				logHook(`pre-tool-use BLOCKED by dir script=${basename(script)} reason=${blockReason}`);
 				return { block: true, reason: blockReason };
 			}
 
@@ -763,6 +804,7 @@ export default function (pi: ExtensionAPI) {
 
 			const text = extractText(result.stdout);
 			if (text) {
+				logHook(`pre-tool-use dir script=${basename(script)} output=${text.slice(0, 100)}`);
 				pi.sendUserMessage(text, { deliverAs: "steer" });
 			}
 		}
@@ -771,10 +813,12 @@ export default function (pi: ExtensionAPI) {
 		for (const { entry } of settingsHooks) {
 			if (entry.type && entry.type !== "command") continue; // Only command type supported for now
 
+			logHook(`pre-tool-use settings cmd=${(entry.command ?? "").slice(0, 80)}`);
 			const result = await runSettingsCommand(entry, input);
 
 			const blockReason = getBlockReason(result);
 			if (blockReason !== null) {
+				logHook(`pre-tool-use BLOCKED by settings hook reason=${blockReason}`);
 				return { block: true, reason: blockReason };
 			}
 
@@ -787,6 +831,7 @@ export default function (pi: ExtensionAPI) {
 
 			const text = extractText(result.stdout);
 			if (text) {
+				logHook(`pre-tool-use settings hook output=${text.slice(0, 100)}`);
 				pi.sendUserMessage(text, { deliverAs: "steer" });
 			}
 		}
@@ -798,6 +843,8 @@ export default function (pi: ExtensionAPI) {
 		const settingsHooks = getSettingsHooksForEvent("post-tool-use", event.toolName, ctx.cwd);
 
 		if (scripts.length === 0 && settingsHooks.length === 0) return;
+
+		logHook(`post-tool-use tool=${event.toolName} id=${event.toolCallId} dir_scripts=${scripts.length} settings_hooks=${settingsHooks.length}`);
 
 		const input: PostToolUseInput = {
 			session_id: ctx.sessionManager.getSessionId(),
@@ -814,10 +861,12 @@ export default function (pi: ExtensionAPI) {
 
 		// Run directory-based scripts first
 		for (const script of scripts) {
+			logHook(`post-tool-use dir script=${basename(script)}`);
 			const result = await runScript(script, input);
 
 			if (result.code === 2) {
 				const msg = result.stderr.trim() || "Hook error";
+				logHook(`post-tool-use dir script=${basename(script)} blocked: ${msg.slice(0, 100)}`);
 				pi.sendUserMessage(msg, { deliverAs: "followUp" });
 				continue;
 			}
@@ -831,6 +880,7 @@ export default function (pi: ExtensionAPI) {
 
 			const text = extractText(result.stdout);
 			if (text) {
+				logHook(`post-tool-use dir script=${basename(script)} output=${text.slice(0, 100)}`);
 				pi.sendUserMessage(text, { deliverAs: "followUp" });
 			}
 		}
@@ -839,10 +889,12 @@ export default function (pi: ExtensionAPI) {
 		for (const { entry } of settingsHooks) {
 			if (entry.type && entry.type !== "command") continue;
 
+			logHook(`post-tool-use settings cmd=${(entry.command ?? "").slice(0, 80)}`);
 			const result = await runSettingsCommand(entry, input);
 
 			if (result.code === 2) {
 				const msg = result.stderr.trim() || "Hook error";
+				logHook(`post-tool-use settings hook blocked: ${msg.slice(0, 100)}`);
 				pi.sendUserMessage(msg, { deliverAs: "followUp" });
 				continue;
 			}
@@ -856,6 +908,7 @@ export default function (pi: ExtensionAPI) {
 
 			const text = extractText(result.stdout);
 			if (text) {
+				logHook(`post-tool-use settings hook output=${text.slice(0, 100)}`);
 				pi.sendUserMessage(text, { deliverAs: "followUp" });
 			}
 		}
@@ -867,6 +920,8 @@ export default function (pi: ExtensionAPI) {
 		const settingsHooks = getSettingsHooksForEvent("agent-stop", undefined, ctx.cwd);
 
 		if (scripts.length === 0 && settingsHooks.length === 0) return;
+
+		logHook(`agent-stop dir_scripts=${scripts.length} settings_hooks=${settingsHooks.length} stop_hook_active=${stopHookActive}`);
 
 		// Capture and reset before running scripts so any re-trigger this turn
 		// reflects the current state, not a stale value from the previous run.
@@ -882,10 +937,12 @@ export default function (pi: ExtensionAPI) {
 
 		// Run directory-based scripts first
 		for (const script of scripts) {
+			logHook(`agent-stop dir script=${basename(script)}`);
 			const result = await runScript(script, input);
 
 			if (result.code === 2) {
 				const msg = result.stderr.trim() || "Hook error";
+				logHook(`agent-stop dir script=${basename(script)} blocked: ${msg.slice(0, 100)}`);
 				stopHookActive = true;
 				pi.sendUserMessage(msg);
 				continue;
@@ -900,6 +957,7 @@ export default function (pi: ExtensionAPI) {
 
 			const text = extractText(result.stdout);
 			if (text) {
+				logHook(`agent-stop dir script=${basename(script)} output=${text.slice(0, 100)}`);
 				stopHookActive = true;
 				pi.sendUserMessage(text);
 			}
@@ -909,10 +967,12 @@ export default function (pi: ExtensionAPI) {
 		for (const { entry } of settingsHooks) {
 			if (entry.type && entry.type !== "command") continue;
 
+			logHook(`agent-stop settings cmd=${(entry.command ?? "").slice(0, 80)}`);
 			const result = await runSettingsCommand(entry, input);
 
 			if (result.code === 2) {
 				const msg = result.stderr.trim() || "Hook error";
+				logHook(`agent-stop settings hook blocked: ${msg.slice(0, 100)}`);
 				stopHookActive = true;
 				pi.sendUserMessage(msg);
 				continue;
@@ -927,6 +987,7 @@ export default function (pi: ExtensionAPI) {
 
 			const text = extractText(result.stdout);
 			if (text) {
+				logHook(`agent-stop settings hook output=${text.slice(0, 100)}`);
 				stopHookActive = true;
 				pi.sendUserMessage(text);
 			}
