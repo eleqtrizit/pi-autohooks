@@ -17,7 +17,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { existsSync, readdirSync, statSync } from "fs";
+import { existsSync, readdirSync, statSync, readFileSync } from "fs";
 import { basename, join } from "path";
 import { homedir } from "os";
 import { spawn } from "child_process";
@@ -59,7 +59,213 @@ interface StopInput {
 }
 
 // ---------------------------------------------------------------------------
-// Script discovery
+// Claude Code settings.json hook types
+// ---------------------------------------------------------------------------
+
+interface SettingsHookEntry {
+	type?: string;
+	command?: string;
+	url?: string;
+	prompt?: string;
+	model?: string;
+	timeout?: number;
+	allowedEnvVars?: string[];
+	args?: string[];
+	/** @deprecated use `if` */
+	if?: string;
+}
+
+interface SettingsHookGroup {
+	matcher?: string;
+	hooks: SettingsHookEntry[];
+}
+
+interface ClaudeSettings {
+	hooks?: Record<string, SettingsHookGroup[]>;
+}
+
+// ---------------------------------------------------------------------------
+// Settings-based hook discovery (reads ~/.claude/settings.json)
+// ---------------------------------------------------------------------------
+
+/**
+ * Event mapping from Claude Code hook event names to pi-autohooks event names.
+ * Only events that pi-autohooks supports are listed.
+ */
+const CLAUDE_TO_PI_EVENT: Record<string, string> = {
+	PreToolUse: "pre-tool-use",
+	PostToolUse: "post-tool-use",
+	Stop: "agent-stop",
+	SessionStart: "session-start",
+};
+
+/**
+ * Loads hook configuration from Claude Code settings files.
+ * Checks ~/.claude/settings.json (global) and .claude/settings.json (project).
+ *
+ * @param cwd - Current working directory (project root)
+ * @returns Parsed hooks config, or null if no settings file has hooks
+ */
+function loadSettingsHooks(cwd: string): ClaudeSettings["hooks"] | null {
+	const candidates = [
+		join(homedir(), ".claude", "settings.json"),
+		join(cwd, ".claude", "settings.json"),
+	];
+
+	let merged: ClaudeSettings["hooks"] | null = null;
+
+	for (const filePath of candidates) {
+		if (!existsSync(filePath)) continue;
+		try {
+			const raw = readFileSync(filePath, "utf-8");
+			const parsed: ClaudeSettings = JSON.parse(raw);
+			if (parsed.hooks && Object.keys(parsed.hooks).length > 0) {
+				if (merged === null) {
+					merged = {};
+				}
+				// Project settings override global ones for the same event key
+				for (const [event, groups] of Object.entries(parsed.hooks)) {
+					merged[event] = groups;
+				}
+			}
+		} catch (err) {
+			console.error(`[hooks-runner] Failed to parse hooks from ${filePath}: ${err}`);
+		}
+	}
+
+	return merged;
+}
+
+/**
+ * Returns the list of settings-based hooks that match a given pi event.
+ *
+ * @param piEvent - pi-autohooks event name (e.g. "pre-tool-use")
+ * @param toolName - Tool name for matcher filtering (only for tool events)
+ * @param cwd - Current working directory
+ * @returns Array of hook entries with their matcher
+ */
+function getSettingsHooksForEvent(
+	piEvent: string,
+	toolName: string | undefined,
+	cwd: string,
+): { entry: SettingsHookEntry; matcher: string }[] {
+	const hooks = loadSettingsHooks(cwd);
+	if (!hooks) return [];
+
+	const results: { entry: SettingsHookEntry; matcher: string }[] = [];
+
+	for (const [claudeEvent, groups] of Object.entries(hooks)) {
+		const mappedEvent = CLAUDE_TO_PI_EVENT[claudeEvent];
+		if (mappedEvent !== piEvent) continue;
+
+		for (const group of groups) {
+			const matcher = group.matcher ?? "";
+
+			// For tool events, check if the matcher matches the tool name
+			if (toolName !== undefined && matcher) {
+				// Matcher can be a pipe-separated list of names or a regex
+				const patterns = matcher.split("|").map((p) => p.trim()).filter(Boolean);
+				const matches = patterns.some((pattern) => {
+					try {
+						return new RegExp(`^${pattern}$`).test(toolName);
+					} catch {
+						return toolName === pattern;
+					}
+				});
+				if (!matches) continue;
+			}
+
+			for (const entry of group.hooks) {
+				results.push({ entry, matcher });
+			}
+		}
+	}
+
+	return results;
+}
+
+/**
+ * Runs a settings-based hook command (type: "command").
+ * Expands ~ to the home directory in the command string.
+ *
+ * @param entry - The hook entry from settings.json
+ * @param input - JSON input to pass via stdin
+ * @returns Script execution result
+ */
+function runSettingsCommand(
+	entry: SettingsHookEntry,
+	input: unknown,
+): Promise<ScriptResult> {
+	const command = (entry.command ?? "").replace(/^~/, homedir());
+	if (!command) {
+		return Promise.resolve({ stdout: "", stderr: "No command specified", code: 1 });
+	}
+
+	return new Promise((resolve) => {
+		const proc = spawn("sh", ["-c", command], {
+			stdio: ["pipe", "pipe", "pipe"],
+			shell: false,
+			env: { ...process.env },
+		});
+
+		let stdout = "";
+		let stderr = "";
+
+		proc.stdout.on("data", (chunk: Buffer) => {
+			stdout += chunk.toString();
+		});
+		proc.stderr.on("data", (chunk: Buffer) => {
+			stderr += chunk.toString();
+		});
+
+		const timeout = entry.timeout ?? SCRIPT_TIMEOUT_MS;
+		const timer = setTimeout(() => {
+			proc.kill("SIGTERM");
+			setTimeout(() => proc.kill("SIGKILL"), 2000);
+			resolve({ stdout, stderr: stderr + "\n[hook timed out]", code: 1 });
+		}, timeout);
+
+		proc.on("close", (code) => {
+			clearTimeout(timer);
+			resolve({ stdout, stderr, code: code ?? 1 });
+		});
+
+		proc.on("error", (err) => {
+			clearTimeout(timer);
+			resolve({ stdout: "", stderr: err.message, code: 1 });
+		});
+
+		try {
+			proc.stdin.write(JSON.stringify(input));
+			proc.stdin.end();
+		} catch {
+			// stdin may already be closed
+		}
+	});
+}
+
+/**
+ * Formats a hook entry for display in the startup summary.
+ *
+ * @param entry - The hook entry
+ * @param eventName - The pi event name
+ * @param matcher - The matcher pattern
+ * @returns Formatted display string
+ */
+function formatHookDisplay(
+	entry: SettingsHookEntry,
+	eventName: string,
+	matcher: string,
+): string {
+	const type = entry.type ?? "command";
+	const cmd = entry.command ?? entry.url ?? entry.prompt ?? "(no command)";
+	const truncated = cmd.length > 60 ? cmd.slice(0, 57) + "..." : cmd;
+	const matchStr = matcher ? ` [matcher: ${matcher}]` : "";
+	return `  • ${eventName}${matchStr} (${type}): ${truncated}`;
+}
+
+// ---------------------------------------------------------------------------
+// Script discovery (directory-based)
 // ---------------------------------------------------------------------------
 
 /**
@@ -396,6 +602,100 @@ export default function (pi: ExtensionAPI) {
 	// Passed to stop scripts as stop_hook_active so they can avoid infinite loops.
 	let stopHookActive = false;
 
+	// --- Startup: show loaded hooks ----------------------------------------
+	pi.on("session_start", async (_event, ctx) => {
+		try {
+			const cwd = ctx.cwd;
+			const settingsHooks = loadSettingsHooks(cwd);
+
+			const lines: string[] = [];
+
+			// Show settings.json hooks
+			if (settingsHooks && Object.keys(settingsHooks).length > 0) {
+				lines.push("📋 Loaded hooks from settings.json:");
+				for (const [claudeEvent, groups] of Object.entries(settingsHooks)) {
+					const mappedEvent = CLAUDE_TO_PI_EVENT[claudeEvent] ?? claudeEvent;
+					for (const group of groups) {
+						for (const entry of group.hooks) {
+							lines.push(formatHookDisplay(entry, mappedEvent, group.matcher ?? ""));
+						}
+					}
+				}
+			}
+
+			// Show directory-based hooks
+			const dirLines: string[] = [];
+			for (const piEvent of ["pre-tool-use", "post-tool-use", "agent-stop"] as const) {
+				const scripts = getHookScripts(piEvent, cwd);
+				for (const script of scripts) {
+					const relPath = script.startsWith(cwd)
+						? "." + script.slice(cwd.length)
+						: script.replace(homedir(), "~");
+					dirLines.push(`  • ${piEvent} (script): ${relPath}`);
+				}
+			}
+			if (dirLines.length > 0) {
+				if (lines.length > 0) lines.push("");
+				lines.push("📋 Loaded hooks from directories:");
+				lines.push(...dirLines);
+			}
+
+			if (lines.length > 0) {
+				ctx.ui.notify(lines.join("\n"), "info");
+			} else {
+				console.log("[hooks-runner] No hooks found in settings.json or directories");
+			}
+		} catch (err) {
+			console.error("[hooks-runner] Error in session_start hook display:", err);
+		}
+	});
+
+	// --- /hooks command (show loaded hooks on demand) ----------------------
+	pi.registerCommand("hooks", {
+		description: "Show all loaded hooks from settings.json and directories",
+		handler: async (_args, ctx) => {
+			const cwd = ctx.cwd;
+			const settingsHooks = loadSettingsHooks(cwd);
+
+			const lines: string[] = [];
+
+			if (settingsHooks && Object.keys(settingsHooks).length > 0) {
+				lines.push("📋 Hooks from settings.json:");
+				for (const [claudeEvent, groups] of Object.entries(settingsHooks)) {
+					const mappedEvent = CLAUDE_TO_PI_EVENT[claudeEvent] ?? claudeEvent;
+					for (const group of groups) {
+						for (const entry of group.hooks) {
+							lines.push(formatHookDisplay(entry, mappedEvent, group.matcher ?? ""));
+						}
+					}
+				}
+			} else {
+				lines.push("No hooks found in settings.json.");
+			}
+
+			const dirLines: string[] = [];
+			for (const piEvent of ["pre-tool-use", "post-tool-use", "agent-stop"] as const) {
+				const scripts = getHookScripts(piEvent, cwd);
+				for (const script of scripts) {
+					const relPath = script.startsWith(cwd)
+						? "." + script.slice(cwd.length)
+						: script.replace(homedir(), "~");
+					dirLines.push(`  • ${piEvent} (script): ${relPath}`);
+				}
+			}
+			if (dirLines.length > 0) {
+				lines.push("");
+				lines.push("📋 Hooks from directories:");
+				lines.push(...dirLines);
+			} else {
+				lines.push("");
+				lines.push("No hooks found in directories.");
+			}
+
+			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
 	// --- /make-hook command -------------------------------------------------
 	pi.registerCommand("make-hook", {
 		description: "Generate and install a hook script via the LLM",
@@ -432,7 +732,9 @@ export default function (pi: ExtensionAPI) {
 	// --- pre-tool-use -------------------------------------------------------
 	pi.on("tool_call", async (event, ctx) => {
 		const scripts = getHookScripts("pre-tool-use", ctx.cwd);
-		if (scripts.length === 0) return;
+		const settingsHooks = getSettingsHooksForEvent("pre-tool-use", event.toolName, ctx.cwd);
+
+		if (scripts.length === 0 && settingsHooks.length === 0) return;
 
 		const input: PreToolUseInput = {
 			session_id: ctx.sessionManager.getSessionId(),
@@ -443,6 +745,7 @@ export default function (pi: ExtensionAPI) {
 			tool_use_id: event.toolCallId,
 		};
 
+		// Run directory-based scripts first
 		for (const script of scripts) {
 			const result = await runScript(script, input);
 
@@ -452,9 +755,32 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (result.code !== 0 && result.code !== 2) {
-				// Non-blocking error — log to stderr and continue
 				console.error(
 					`[hooks-runner] pre-tool-use script ${basename(script)} exited with code ${result.code}: ${result.stderr}`
+				);
+				continue;
+			}
+
+			const text = extractText(result.stdout);
+			if (text) {
+				pi.sendUserMessage(text, { deliverAs: "steer" });
+			}
+		}
+
+		// Then run settings-based hooks
+		for (const { entry } of settingsHooks) {
+			if (entry.type && entry.type !== "command") continue; // Only command type supported for now
+
+			const result = await runSettingsCommand(entry, input);
+
+			const blockReason = getBlockReason(result);
+			if (blockReason !== null) {
+				return { block: true, reason: blockReason };
+			}
+
+			if (result.code !== 0 && result.code !== 2) {
+				console.error(
+					`[hooks-runner] settings pre-tool-use hook exited with code ${result.code}: ${result.stderr}`
 				);
 				continue;
 			}
@@ -469,7 +795,9 @@ export default function (pi: ExtensionAPI) {
 	// --- post-tool-use ------------------------------------------------------
 	pi.on("tool_result", async (event, ctx) => {
 		const scripts = getHookScripts("post-tool-use", ctx.cwd);
-		if (scripts.length === 0) return;
+		const settingsHooks = getSettingsHooksForEvent("post-tool-use", event.toolName, ctx.cwd);
+
+		if (scripts.length === 0 && settingsHooks.length === 0) return;
 
 		const input: PostToolUseInput = {
 			session_id: ctx.sessionManager.getSessionId(),
@@ -484,6 +812,7 @@ export default function (pi: ExtensionAPI) {
 			tool_use_id: event.toolCallId,
 		};
 
+		// Run directory-based scripts first
 		for (const script of scripts) {
 			const result = await runScript(script, input);
 
@@ -505,12 +834,39 @@ export default function (pi: ExtensionAPI) {
 				pi.sendUserMessage(text, { deliverAs: "followUp" });
 			}
 		}
+
+		// Then run settings-based hooks
+		for (const { entry } of settingsHooks) {
+			if (entry.type && entry.type !== "command") continue;
+
+			const result = await runSettingsCommand(entry, input);
+
+			if (result.code === 2) {
+				const msg = result.stderr.trim() || "Hook error";
+				pi.sendUserMessage(msg, { deliverAs: "followUp" });
+				continue;
+			}
+
+			if (result.code !== 0) {
+				console.error(
+					`[hooks-runner] settings post-tool-use hook exited with code ${result.code}: ${result.stderr}`
+				);
+				continue;
+			}
+
+			const text = extractText(result.stdout);
+			if (text) {
+				pi.sendUserMessage(text, { deliverAs: "followUp" });
+			}
+		}
 	});
 
 	// --- agent-stop ---------------------------------------------------------
 	pi.on("agent_end", async (_event, ctx) => {
 		const scripts = getHookScripts("agent-stop", ctx.cwd);
-		if (scripts.length === 0) return;
+		const settingsHooks = getSettingsHooksForEvent("agent-stop", undefined, ctx.cwd);
+
+		if (scripts.length === 0 && settingsHooks.length === 0) return;
 
 		// Capture and reset before running scripts so any re-trigger this turn
 		// reflects the current state, not a stale value from the previous run.
@@ -524,6 +880,7 @@ export default function (pi: ExtensionAPI) {
 			stop_hook_active: wasStopHookActive,
 		};
 
+		// Run directory-based scripts first
 		for (const script of scripts) {
 			const result = await runScript(script, input);
 
@@ -537,6 +894,33 @@ export default function (pi: ExtensionAPI) {
 			if (result.code !== 0) {
 				console.error(
 					`[hooks-runner] agent-stop script ${basename(script)} exited with code ${result.code}: ${result.stderr}`
+				);
+				continue;
+			}
+
+			const text = extractText(result.stdout);
+			if (text) {
+				stopHookActive = true;
+				pi.sendUserMessage(text);
+			}
+		}
+
+		// Then run settings-based hooks
+		for (const { entry } of settingsHooks) {
+			if (entry.type && entry.type !== "command") continue;
+
+			const result = await runSettingsCommand(entry, input);
+
+			if (result.code === 2) {
+				const msg = result.stderr.trim() || "Hook error";
+				stopHookActive = true;
+				pi.sendUserMessage(msg);
+				continue;
+			}
+
+			if (result.code !== 0) {
+				console.error(
+					`[hooks-runner] settings agent-stop hook exited with code ${result.code}: ${result.stderr}`
 				);
 				continue;
 			}
