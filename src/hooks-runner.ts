@@ -101,7 +101,10 @@ const CLAUDE_TO_PI_EVENT: Record<string, string> = {
 
 /**
  * Loads hook configuration from Claude Code settings files.
- * Checks ~/.claude/settings.json (global) and .claude/settings.json (project).
+ * Checks:
+ *   - ~/.claude/settings.json (global)
+ *   - <cwd>/.claude/settings.json (project, dotted)
+ *   - <cwd>/claude/settings.json (project, undotted)
  *
  * @param cwd - Current working directory (project root)
  * @returns Parsed hooks config, or null if no settings file has hooks
@@ -110,6 +113,7 @@ function loadSettingsHooks(cwd: string): ClaudeSettings["hooks"] | null {
 	const candidates = [
 		join(homedir(), ".claude", "settings.json"),
 		join(cwd, ".claude", "settings.json"),
+		join(cwd, "claude", "settings.json"),
 	];
 
 	let merged: ClaudeSettings["hooks"] | null = null;
