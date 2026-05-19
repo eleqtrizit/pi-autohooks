@@ -4,17 +4,37 @@ Run user-defined scripts at key lifecycle points in the [Pi coding agent](https:
 
 Uses the Claude Code-compatible JSON stdin/stdout protocol, so scripts written for Claude Code hooks work here without modification.
 
+**Quick Links:** [Documentation](docs/) | [Examples](examples/) | [Events Reference](docs/events.md)
+
 ---
 
 ## Features
 
 ### Three hook stages
 
-| Stage | Fires | Use cases |
-|-------|-------|-----------|
-| `pre-tool-use` | Before a tool executes | Block dangerous commands, validate inputs, inject context |
-| `post-tool-use` | After a tool returns | Validate results, log output, inject follow-up context |
-| `agent-stop` | When the agent finishes a turn | Auto-run follow-up tasks, guard against incomplete work |
+| Stage | Event | Fires | Use cases |
+|-------|-------|-------|-----------|
+| `pre-tool-use` | `tool_call` | Before a tool executes | Block dangerous commands, validate inputs, inject context |
+| `post-tool-use` | `tool_result` | After a tool returns | Validate results, log output, inject follow-up context |
+| `agent-stop` | `agent_end` | When the agent finishes a turn | Auto-run follow-up tasks, guard against incomplete work |
+
+### Hook execution flow
+
+```
+User Request
+    ↓
+[pre-tool-use hooks] ← Can block tool execution
+    ↓
+Tool Executes
+    ↓
+[post-tool-use hooks] ← Can validate/modify results
+    ↓
+Agent Processes Result
+    ↓
+[agent-stop hooks] ← Can trigger follow-up actions
+    ↓
+Next Turn / Response
+```
 
 ### Script discovery
 
@@ -23,46 +43,96 @@ Uses the Claude Code-compatible JSON stdin/stdout protocol, so scripts written f
 - Project-local scripts **shadow** global ones by filename (no duplication)
 - Scripts are discovered fresh on every event — add or remove scripts without restarting
 - Only executable files are picked up, sorted alphabetically
+- Supports any scripting language: bash, Python, Ruby, Go binaries, etc.
+
+**Script execution order:**
+1. All project-local scripts (alphabetically by filename)
+2. All global scripts (alphabetically by filename)
+3. Scripts run sequentially; each must complete before the next starts
 
 ### Communication protocol
 
-Scripts receive JSON on **stdin** and communicate back via **stdout** and **exit code**:
+Scripts receive JSON on **stdin** and communicate back via **stdout**, **stderr**, and **exit code**:
 
-```
-exit 0   → success (stdout returned to agent as context)
-exit 2   → block the action (stderr used as reason)
-```
+#### Exit codes
 
-JSON output fields understood:
+| Code | Meaning |
+|------|---------|
+| `0` | Success — process normally, use stdout for context |
+| `2` | Block/reject — use stderr as the rejection reason |
+| `1` (or other) | Error — logged to console, execution continues |
 
-| Field | Purpose |
-|-------|---------|
-| `hookSpecificOutput.additionalContext` | Context injected into the agent |
-| `hookSpecificOutput.permissionDecision` | `"deny"` to block (pre-tool-use) |
-| `hookSpecificOutput.permissionDecisionReason` | Reason shown when blocking |
-| `systemMessage` | Message injected as system context |
-| `decision` | `"block"` to block (post-tool-use / stop) |
-| `reason` | Reason shown when blocking |
+#### JSON output fields
 
-Raw text output (non-JSON) is sent directly to the agent as context.
+| Field | Stage | Purpose |
+|-------|-------|---------|
+| `hookSpecificOutput.additionalContext` | pre-tool-use | Context injected into the agent |
+| `hookSpecificOutput.permissionDecision` | pre-tool-use | `"deny"` to block the tool call |
+| `hookSpecificOutput.permissionDecisionReason` | pre-tool-use | Reason shown when blocking |
+| `systemMessage` | post-tool-use | Message injected as system context |
+| `decision` | post-tool-use/agent-stop | `"block"` to block/reject |
+| `reason` | post-tool-use/agent-stop | Reason shown when blocking |
+
+#### Output priority
+
+1. **Exit 2** — Immediate block, stderr shown as reason
+2. **JSON `permissionDecision: "deny"`** — Block with structured reason
+3. **JSON `decision: "block"`** — Block/reject with reason
+4. **stdout text/JSON** — Injected as context for the agent
+5. **Raw text** — Sent directly to the agent as context
+
+**Note:** Scripts have a **30-second timeout**. On timeout, the process receives `SIGTERM` then `SIGKILL` after 2 seconds.
 
 ### `/make-hook` command
 
 An interactive command that guides the LLM to generate and install a hook script for you:
 
-```
+```bash
 /make-hook validate that dangerous shell commands require confirmation
 ```
 
-Prompts for scope (project or global) and writes the script to the right directory.
+**What it does:**
+1. Prompts for the hook scope (project or global)
+2. Determines the appropriate hook stage(s) based on your description
+3. Writes the script(s) to the correct directory
+4. Makes them executable
+5. Explains when each script will fire
+
+**Example usage:**
+```bash
+# Log all tool calls
+/make-hook log every tool call to /tmp/tool-calls.log
+
+# Block destructive commands
+/make-hook block any rm -rf commands that target system directories
+
+# Auto-validate tests after writes
+/make-hook run tests after any file write operation
+```
 
 ### Timeout protection
 
-Scripts have a 30-second execution limit. On timeout, the process receives `SIGTERM` then `SIGKILL` after 2 seconds — the agent is never left hanging.
+Scripts have a **30-second execution limit**. On timeout:
+1. Process receives `SIGTERM`
+2. After 2 seconds, receives `SIGKILL`
+3. Agent continues without hanging
 
 ### Infinite loop guard
 
-The `agent-stop` input includes `stop_hook_active: true` when the agent was re-triggered by a previous stop hook. Use this flag to prevent runaway loops.
+The `agent-stop` input includes `stop_hook_active: true` when the agent was re-triggered by a previous stop hook. Use this flag to prevent runaway loops:
+
+```bash
+#!/usr/bin/env bash
+INPUT=$(cat)
+STOP_HOOK_ACTIVE=$(echo "$INPUT" | jq -r '.stop_hook_active')
+
+if [[ "$STOP_HOOK_ACTIVE" == "true" ]]; then
+  echo "Already triggered by stop hook this turn — skipping" >&2
+  exit 0  # Don't block, just skip
+fi
+
+# Your hook logic here...
+```
 
 ---
 
@@ -75,13 +145,14 @@ Add to your Pi `settings.json`:
 ```json
 {
   "packages": [
-    "git:github.com/YOUR_USERNAME/pi-autohooks"
+    "git:github.com/mariozechner/pi-autohooks"
   ]
 }
 ```
 
-Or reference it locally:
+### Local development
 
+**Option 1: Direct extension reference**
 ```json
 {
   "extensions": [
@@ -90,16 +161,12 @@ Or reference it locally:
 }
 ```
 
-### Global extension
-
-Copy or symlink the extension into Pi's global extensions directory:
-
+**Option 2: Copy to global extensions**
 ```bash
 cp -r /path/to/pi-autohooks ~/.pi/agent/extensions/pi-autohooks
 ```
 
-### Project-local extension
-
+**Option 3: Copy to project**
 ```bash
 cp -r /path/to/pi-autohooks .pi/extensions/pi-autohooks
 ```
@@ -107,7 +174,7 @@ cp -r /path/to/pi-autohooks .pi/extensions/pi-autohooks
 ### From source
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/pi-autohooks
+git clone https://github.com/mariozechner/pi-autohooks
 cd pi-autohooks
 npm install
 ```
@@ -117,6 +184,19 @@ npm install
 ---
 
 ## Writing hook scripts
+
+### File locations
+
+| Scope | Base path | Example |
+|-------|-----------|---------|
+| Project | `<repo>/.pi/autohooks/<stage>/` | `.pi/autohooks/pre-tool-use/my-hook.sh` |
+| Global | `~/.pi/agent/autohooks/<stage>/` | `~/.pi/agent/autohooks/pre-tool-use/my-hook.sh` |
+
+**Important:**
+- Scripts must be **executable** (`chmod +x`)
+- Scripts are discovered **fresh on every event** — no restart needed
+- Project scripts **shadow** global scripts with the same filename
+- Scripts run **alphabetically** by filename
 
 ### Minimum viable hook (bash)
 
@@ -128,7 +208,50 @@ echo "$INPUT" | jq .  # do something with it
 exit 0                # success
 ```
 
-### Block a tool call
+### Minimum viable hook (Python)
+
+```python
+#!/usr/bin/env python3
+import json, sys
+
+data = json.load(sys.stdin)
+print(json.dumps({"hookSpecificOutput": {"additionalContext": "Hello from hook!"}}))
+sys.exit(0)
+```
+
+### Output options
+
+#### Allow and inject context
+
+```bash
+#!/usr/bin/env bash
+INPUT=$(cat)
+TOOL=$(echo "$INPUT" | jq -r '.tool_name')
+
+if [[ "$TOOL" == "Write" ]]; then
+  echo '{"hookSpecificOutput":{"additionalContext":"Remember: all new files need a license header."}}'
+fi
+exit 0
+```
+
+#### Block with exit code 2
+
+```bash
+#!/usr/bin/env bash
+INPUT=$(cat)
+TOOL=$(echo "$INPUT" | jq -r '.tool_name')
+
+if [[ "$TOOL" == "Bash" ]]; then
+  COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
+  if echo "$COMMAND" | grep -qE 'rm\s+-rf\s+/'; then
+    echo "Refusing rm -rf /" >&2
+    exit 2
+  fi
+fi
+exit 0
+```
+
+#### Block with JSON (pre-tool-use)
 
 ```bash
 #!/usr/bin/env bash
@@ -142,48 +265,32 @@ if [[ "$TOOL" == "Bash" ]]; then
     exit 0
   fi
 fi
-
 exit 0
 ```
 
-### Inject context (Python)
-
-```python
-#!/usr/bin/env python3
-import json, sys
-
-data = json.load(sys.stdin)
-tool = data.get("tool_name", "")
-
-if tool == "Write":
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "additionalContext": "Remember: all new files need a licence header."
-        }
-    }))
-
-sys.exit(0)
-```
-
-### Install a hook
+#### Block with JSON (post-tool-use / agent-stop)
 
 ```bash
-# Project-local
-mkdir -p .pi/autohooks/pre-tool-use
-cp my-validator.sh .pi/autohooks/pre-tool-use/
-chmod +x .pi/autohooks/pre-tool-use/my-validator.sh
+#!/usr/bin/env bash
+INPUT=$(cat)
+TOOL=$(echo "$INPUT" | jq -r '.tool_name')
 
-# Global
-mkdir -p ~/.pi/agent/autohooks/pre-tool-use
-cp my-validator.sh ~/.pi/agent/autohooks/pre-tool-use/
-chmod +x ~/.pi/agent/autohooks/pre-tool-use/my-validator.sh
+if [[ "$TOOL" == "Write" ]]; then
+  # Check if file was written to a protected path
+  FILE=$(echo "$INPUT" | jq -r '.tool_input.path // ""')
+  if echo "$FILE" | grep -q "^/etc/"; then
+    echo '{"decision":"block","reason":"Cannot write to /etc/"}'
+    exit 0
+  fi
+fi
+exit 0
 ```
 
 ---
 
 ## Input schema reference
 
-### `pre-tool-use`
+### `pre-tool-use` (before tool executes)
 
 ```jsonc
 {
@@ -196,7 +303,9 @@ chmod +x ~/.pi/agent/autohooks/pre-tool-use/my-validator.sh
 }
 ```
 
-### `post-tool-use`
+**Available tools:** `Bash`, `Read`, `Write`, `Edit`, `Glob`, `LS`, `NotebookEdit`, etc.
+
+### `post-tool-use` (after tool returns)
 
 ```jsonc
 {
@@ -210,7 +319,12 @@ chmod +x ~/.pi/agent/autohooks/pre-tool-use/my-validator.sh
 }
 ```
 
-### `agent-stop`
+**Note:** `tool_response.content` format varies by tool:
+- `Bash`: `{ "content": "...", "isError": false }`
+- `Read`: `{ "content": "file contents", "isError": false }`
+- `Write`: `{ "content": null, "isError": false }`
+
+### `agent-stop` (when agent finishes a turn)
 
 ```jsonc
 {
@@ -220,6 +334,8 @@ chmod +x ~/.pi/agent/autohooks/pre-tool-use/my-validator.sh
   "stop_hook_active": false
 }
 ```
+
+**Important:** `stop_hook_active: true` means the agent was already triggered by a stop hook this turn — use this to prevent infinite loops.
 
 ---
 
@@ -240,14 +356,125 @@ examples/
     └── sample.py
 ```
 
+### Quick example: Block dangerous commands
+
+**Create the hook:**
+```bash
+mkdir -p .pi/autohooks/pre-tool-use
+cat > .pi/autohooks/pre-tool-use/block-dangerous.sh << 'EOF'
+#!/usr/bin/env bash
+set -e
+INPUT=$(cat)
+TOOL=$(echo "$INPUT" | jq -r '.tool_name')
+
+if [[ "$TOOL" == "Bash" ]]; then
+  COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
+  # Block rm -rf on system directories
+  if echo "$COMMAND" | grep -qE 'rm\s+-rf\s+/(bin|sbin|usr|etc|lib|var)'; then
+    echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"Refusing to delete system files"}}'
+    exit 0
+  fi
+fi
+exit 0
+EOF
+chmod +x .pi/autohooks/pre-tool-use/block-dangerous.sh
+```
+
+### Quick example: Log all tool calls
+
+**Create the hook:**
+```bash
+mkdir -p .pi/autohooks/pre-tool-use
+cat > .pi/autohooks/pre-tool-use/log-calls.py << 'EOF'
+#!/usr/bin/env python3
+import json, sys, os
+from datetime import datetime
+
+log_file = os.path.join(os.getenv('TMPDIR', '/tmp'), 'pi-hooks.log')
+data = json.load(sys.stdin)
+
+with open(log_file, 'a') as f:
+    f.write(f"\n{datetime.utcnow().isoformat()}Z\n")
+    f.write(json.dumps(data, indent=2) + "\n")
+
+sys.exit(0)
+EOF
+chmod +x .pi/autohooks/pre-tool-use/log-calls.py
+```
+
 ---
 
 ## Development
 
+### Setup
+
 ```bash
+git clone https://github.com/mariozechner/pi-autohooks
+cd pi-autohooks
 npm install
+```
+
+### Testing
+
+```bash
 npm test
 ```
+
+### Debugging hooks
+
+To debug your hook scripts:
+
+```bash
+# Add logging to see what's being passed
+echo "DEBUG: $(cat)" >> /tmp/hook-debug.log
+
+# Test a script manually
+echo '{"tool_name":"Bash","tool_input":{"command":"ls"}}' | ./my-hook.sh
+```
+
+### Package structure
+
+```
+pi-autohooks/
+├── extensions/
+│   └── index.ts          # Extension entry point
+├── src/
+│   └── hooks-runner.ts   # Core hook execution logic
+├── examples/
+│   ├── pre-tool-use/
+│   ├── post-tool-use/
+│   └── agent-stop/
+├── docs/                 # Extension documentation
+└── package.json
+```
+
+### Available npm packages in hooks
+
+Hooks can use any npm package available in the Pi environment. Common packages include:
+- Standard Node.js modules: `fs`, `path`, `child_process`, etc.
+- JSON parsing: Built-in `JSON.parse()` / `JSON.stringify()`
+- For complex logic, use Python/bash with standard libraries
+
+---
+
+## Troubleshooting
+
+### Script not running
+
+1. **Check it's executable:** `chmod +x my-hook.sh`
+2. **Check the path:** Scripts must be in `.pi/autohooks/<stage>/`
+3. **Check the event:** Make sure you're using the right stage for your use case
+4. **Check logs:** Look for errors in the Pi console
+
+### Script errors
+
+- Exit code `1` (or other non-0/2): Logged to console, execution continues
+- Exit code `2`: Blocks the action, stderr shown as reason
+- Exit code `0`: Success, stdout used for context
+
+### Timeout
+
+If your script takes longer than 30 seconds, it will be terminated. Optimize your script or split into smaller hooks.
 
 ---
 
