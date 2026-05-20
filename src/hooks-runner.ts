@@ -171,9 +171,9 @@ function getSettingsHooksForEvent(
 				const patterns = matcher.split("|").map((p) => p.trim()).filter(Boolean);
 				const matches = patterns.some((pattern) => {
 					try {
-						return new RegExp(`^${pattern}$`).test(toolName);
+						return new RegExp(`^${pattern}$`, "i").test(toolName);
 					} catch {
-						return toolName === pattern;
+						return toolName.toLowerCase() === pattern.toLowerCase();
 					}
 				});
 				if (!matches) continue;
