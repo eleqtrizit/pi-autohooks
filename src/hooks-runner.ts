@@ -638,8 +638,8 @@ export default function (pi: ExtensionAPI) {
 	// Passed to stop scripts as stop_hook_active so they can avoid infinite loops.
 	let stopHookActive = false;
 
-	// --- /disable-hooks command --------------------------------------------
-	pi.registerCommand("disable-hooks", {
+	// --- /hooks-disable command --------------------------------------------
+	pi.registerCommand("hooks-disable", {
 		description: "Disable all hooks for the current session",
 		handler: async (_args, ctx) => {
 			hooksEnabled = false;
@@ -647,8 +647,8 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// --- /enable-hooks command ---------------------------------------------
-	pi.registerCommand("enable-hooks", {
+	// --- /hooks-enable command ---------------------------------------------
+	pi.registerCommand("hooks-enable", {
 		description: "Re-enable all hooks for the current session",
 		handler: async (_args, ctx) => {
 			hooksEnabled = true;
