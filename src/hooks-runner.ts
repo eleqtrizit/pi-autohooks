@@ -631,9 +631,30 @@ function logHook(message: string): void {
 }
 
 export default function (pi: ExtensionAPI) {
+	// Whether hooks are enabled. Defaults to true. Can be toggled via /disable-hooks and /enable-hooks.
+	let hooksEnabled = true;
+
 	// Tracks whether the most recent agent run was triggered by an agent-stop hook.
 	// Passed to stop scripts as stop_hook_active so they can avoid infinite loops.
 	let stopHookActive = false;
+
+	// --- /disable-hooks command --------------------------------------------
+	pi.registerCommand("disable-hooks", {
+		description: "Disable all hooks for the current session",
+		handler: async (_args, ctx) => {
+			hooksEnabled = false;
+			ctx.ui.notify("⛔ Hooks disabled", "info");
+		},
+	});
+
+	// --- /enable-hooks command ---------------------------------------------
+	pi.registerCommand("enable-hooks", {
+		description: "Re-enable all hooks for the current session",
+		handler: async (_args, ctx) => {
+			hooksEnabled = true;
+			ctx.ui.notify("✅ Hooks enabled", "info");
+		},
+	});
 
 	// --- Startup: show loaded hooks ----------------------------------------
 	pi.on("session_start", async (_event, ctx) => {
@@ -682,6 +703,8 @@ export default function (pi: ExtensionAPI) {
 					lines.push("");
 					lines.push("\x1b[41m\x1b[97m⚠ HOOK LOG ENABLED ~/.pi/autohooks.log ⚠\x1b[0m");
 				}
+				lines.push("");
+				lines.push(hooksEnabled ? "✅ Hooks enabled" : "⛔ Hooks disabled");
 				ctx.ui.notify(lines.join("\n"), "info");
 			} else {
 				console.log("[hooks-runner] No hooks found in settings.json or directories");
@@ -699,6 +722,9 @@ export default function (pi: ExtensionAPI) {
 			const settingsHooks = loadSettingsHooks(cwd);
 
 			const lines: string[] = [];
+
+			lines.push(hooksEnabled ? "✅ Hooks enabled" : "⛔ Hooks disabled");
+			lines.push("");
 
 			if (settingsHooks && Object.keys(settingsHooks).length > 0) {
 				lines.push("📋 Hooks from settings.json:");
@@ -772,6 +798,8 @@ export default function (pi: ExtensionAPI) {
 
 	// --- pre-tool-use -------------------------------------------------------
 	pi.on("tool_call", async (event, ctx) => {
+		if (!hooksEnabled) return;
+
 		const scripts = getHookScripts("pre-tool-use", ctx.cwd);
 		const settingsHooks = getSettingsHooksForEvent("pre-tool-use", event.toolName, ctx.cwd);
 
@@ -843,6 +871,8 @@ export default function (pi: ExtensionAPI) {
 
 	// --- post-tool-use ------------------------------------------------------
 	pi.on("tool_result", async (event, ctx) => {
+		if (!hooksEnabled) return;
+
 		const scripts = getHookScripts("post-tool-use", ctx.cwd);
 		const settingsHooks = getSettingsHooksForEvent("post-tool-use", event.toolName, ctx.cwd);
 
@@ -920,6 +950,8 @@ export default function (pi: ExtensionAPI) {
 
 	// --- agent-stop ---------------------------------------------------------
 	pi.on("agent_end", async (_event, ctx) => {
+		if (!hooksEnabled) return;
+
 		const scripts = getHookScripts("agent-stop", ctx.cwd);
 		const settingsHooks = getSettingsHooksForEvent("agent-stop", undefined, ctx.cwd);
 
