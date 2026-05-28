@@ -189,8 +189,54 @@ function getSettingsHooksForEvent(
 }
 
 /**
+ * Converts a pi-autohooks input object to the Claude Desktop hook protocol format.
+ *
+ * Claude Desktop passes tool params under a `params` key at the top level,
+ * while Claude Code / pi-autohooks uses the flat Claude Code protocol with
+ * `tool_input`, `tool_name`, etc. at the top level.
+ *
+ * This bridge ensures existing `~/.claude/hooks/` scripts (written for
+ * Claude Desktop) receive the format they expect.
+ *
+ * Claude Desktop format for a Bash tool call:
+ * ```json
+ * {
+ *   "params": {
+ *     "command": "ls -la",
+ *     "tool": "Bash"
+ *   }
+ * }
+ * ```
+ */
+function toClaudeDesktopFormat(input: unknown): unknown {
+	if (typeof input !== "object" || input === null) return input;
+
+	const piInput = input as Record<string, unknown>;
+
+	// Only transform pre/post tool-use inputs (they have tool_input)
+	if (piInput.tool_input && typeof piInput.tool_input === "object") {
+		const toolInput = piInput.tool_input as Record<string, unknown>;
+		const toolName = typeof piInput.tool_name === "string" ? piInput.tool_name : "";
+
+		// Build the Claude Desktop params from the tool input fields
+		const params: Record<string, unknown> = { ...toolInput };
+
+		// Claude Desktop also includes the tool name as "tool" in params
+		if (toolName) {
+			params.tool = toolName;
+		}
+
+		return { params };
+	}
+
+	return input;
+}
+
+/**
  * Runs a settings-based hook command (type: "command").
  * Expands ~ to the home directory in the command string.
+ * The input is bridged to Claude Desktop format so existing
+ * `~/.claude/hooks/` scripts work without modification.
  *
  * @param entry - The hook entry from settings.json
  * @param input - JSON input to pass via stdin
@@ -204,6 +250,9 @@ function runSettingsCommand(
 	if (!command) {
 		return Promise.resolve({ stdout: "", stderr: "No command specified", code: 1 });
 	}
+
+	// Bridge to Claude Desktop format so existing ~/.claude/hooks/ scripts work
+	const desktopInput = toClaudeDesktopFormat(input);
 
 	return new Promise((resolve) => {
 		const proc = spawn("sh", ["-c", command], {
@@ -240,7 +289,7 @@ function runSettingsCommand(
 		});
 
 		try {
-			proc.stdin.write(JSON.stringify(input));
+			proc.stdin.write(JSON.stringify(desktopInput));
 			proc.stdin.end();
 		} catch {
 			// stdin may already be closed
