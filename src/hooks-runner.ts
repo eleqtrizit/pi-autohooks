@@ -841,7 +841,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const prompt = buildMakeHookPrompt(description, scope as "project" | "global", ctx.cwd);
-			pi.sendUserMessage(prompt);
+			pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 		},
 	});
 
@@ -1029,7 +1029,7 @@ export default function (pi: ExtensionAPI) {
 				const msg = result.stderr.trim() || "Hook error";
 				logHook(`agent-stop dir script=${basename(script)} blocked: ${msg.slice(0, 100)}`);
 				stopHookActive = true;
-				pi.sendUserMessage(msg);
+				pi.sendUserMessage(msg, { deliverAs: "followUp" });
 				continue;
 			}
 
@@ -1044,7 +1044,7 @@ export default function (pi: ExtensionAPI) {
 			if (text) {
 				logHook(`agent-stop dir script=${basename(script)} output=${text.slice(0, 100)}`);
 				stopHookActive = true;
-				pi.sendUserMessage(text);
+				pi.sendUserMessage(text, { deliverAs: "followUp" });
 			}
 		}
 
@@ -1059,7 +1059,7 @@ export default function (pi: ExtensionAPI) {
 				const msg = result.stderr.trim() || "Hook error";
 				logHook(`agent-stop settings hook blocked: ${msg.slice(0, 100)}`);
 				stopHookActive = true;
-				pi.sendUserMessage(msg);
+				pi.sendUserMessage(msg, { deliverAs: "followUp" });
 				continue;
 			}
 
@@ -1074,7 +1074,7 @@ export default function (pi: ExtensionAPI) {
 			if (text) {
 				logHook(`agent-stop settings hook output=${text.slice(0, 100)}`);
 				stopHookActive = true;
-				pi.sendUserMessage(text);
+				pi.sendUserMessage(text, { deliverAs: "followUp" });
 			}
 		}
 	});
