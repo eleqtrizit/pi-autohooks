@@ -755,8 +755,6 @@ export default function (pi: ExtensionAPI) {
 				lines.push("");
 				lines.push(hooksEnabled ? "✅ Hooks enabled" : "⛔ Hooks disabled");
 				ctx.ui.notify(lines.join("\n"), "info");
-			} else {
-				console.log("[hooks-runner] No hooks found in settings.json or directories");
 			}
 		} catch (err) {
 			console.error("[hooks-runner] Error in session_start hook display:", err);
