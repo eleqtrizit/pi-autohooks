@@ -36,6 +36,10 @@ Agent Processes Result
 Next Turn / Response
 ```
 
+Post-tool and agent-stop feedback produced during one agent run is coalesced into
+a single follow-up prompt. For example, ten edits that each produce hook feedback
+result in one queued prompt containing all ten results, in execution order.
+
 ### Script discovery
 
 - **Project-local**: `.pi/autohooks/<stage>/` — scoped to the current repo

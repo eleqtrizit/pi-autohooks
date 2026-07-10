@@ -504,6 +504,28 @@ function getBlockReason(result: ScriptResult): string | null {
 	return null;
 }
 
+/**
+ * Combines hook feedback collected during one agent run into one user prompt.
+ * A single result is returned unchanged; multiple results get explicit
+ * boundaries so the model can distinguish independent hook responses.
+ *
+ * @param prompts - Hook messages in the order they were produced
+ * @returns A single prompt, or an empty string when there is no feedback
+ */
+export function mergeHookPrompts(prompts: readonly string[]): string {
+	if (prompts.length === 0) return "";
+	if (prompts.length === 1) return prompts[0];
+
+	const results = prompts.map(
+		(prompt, index) => `<hook-result index="${index + 1}">\n${prompt}\n</hook-result>`,
+	);
+
+	return [
+		"Multiple hook results were produced during the previous agent run. Address all of them:",
+		...results,
+	].join("\n\n");
+}
+
 // ---------------------------------------------------------------------------
 // Hook recipes (static reference data for the /make-hook prompt)
 // ---------------------------------------------------------------------------
@@ -683,15 +705,35 @@ export default function (pi: ExtensionAPI) {
 	// Whether hooks are enabled. Defaults to true. Can be toggled via /disable-hooks and /enable-hooks.
 	let hooksEnabled = true;
 
+	// Post-tool and agent-stop feedback is collected for the active agent run,
+	// then delivered as one follow-up prompt when the run ends.
+	let pendingHookPrompts: string[] = [];
+
 	// Tracks whether the most recent agent run was triggered by an agent-stop hook.
 	// Passed to stop scripts as stop_hook_active so they can avoid infinite loops.
 	let stopHookActive = false;
+
+	const queueHookPrompt = (prompt: string): void => {
+		pendingHookPrompts.push(prompt);
+	};
+
+	const flushHookPrompts = (): void => {
+		const prompts = pendingHookPrompts;
+		pendingHookPrompts = [];
+
+		const mergedPrompt = mergeHookPrompts(prompts);
+		if (!mergedPrompt) return;
+
+		logHook(`flushing ${prompts.length} hook result(s) as one follow-up prompt`);
+		pi.sendUserMessage(mergedPrompt, { deliverAs: "followUp" });
+	};
 
 	// --- /hooks-disable command --------------------------------------------
 	pi.registerCommand("hooks-disable", {
 		description: "Disable all hooks for the current session",
 		handler: async (_args, ctx) => {
 			hooksEnabled = false;
+			pendingHookPrompts = [];
 			ctx.ui.notify("⛔ Hooks disabled", "info");
 		},
 	});
@@ -708,6 +750,7 @@ export default function (pi: ExtensionAPI) {
 	// --- Startup: show loaded hooks ----------------------------------------
 	pi.on("session_start", async (_event, ctx) => {
 		try {
+			pendingHookPrompts = [];
 			const cwd = ctx.cwd;
 			logHook(`session_start cwd=${cwd}`);
 
@@ -759,6 +802,12 @@ export default function (pi: ExtensionAPI) {
 		} catch (err) {
 			console.error("[hooks-runner] Error in session_start hook display:", err);
 		}
+	});
+
+	// Start each agent run with an empty buffer. This also discards stale
+	// feedback if a prior run was aborted before agent_end could flush it.
+	pi.on("agent_start", async () => {
+		pendingHookPrompts = [];
 	});
 
 	// --- /hooks command (show loaded hooks on demand) ----------------------
@@ -948,7 +997,7 @@ export default function (pi: ExtensionAPI) {
 			if (result.code === 2) {
 				const msg = result.stderr.trim() || "Hook error";
 				logHook(`post-tool-use dir script=${basename(script)} blocked: ${msg.slice(0, 100)}`);
-				pi.sendUserMessage(msg, { deliverAs: "followUp" });
+				queueHookPrompt(msg);
 				continue;
 			}
 
@@ -962,7 +1011,7 @@ export default function (pi: ExtensionAPI) {
 			const text = extractText(result.stdout);
 			if (text) {
 				logHook(`post-tool-use dir script=${basename(script)} output=${text.slice(0, 100)}`);
-				pi.sendUserMessage(text, { deliverAs: "followUp" });
+				queueHookPrompt(text);
 			}
 		}
 
@@ -976,7 +1025,7 @@ export default function (pi: ExtensionAPI) {
 			if (result.code === 2) {
 				const msg = result.stderr.trim() || "Hook error";
 				logHook(`post-tool-use settings hook blocked: ${msg.slice(0, 100)}`);
-				pi.sendUserMessage(msg, { deliverAs: "followUp" });
+				queueHookPrompt(msg);
 				continue;
 			}
 
@@ -990,21 +1039,24 @@ export default function (pi: ExtensionAPI) {
 			const text = extractText(result.stdout);
 			if (text) {
 				logHook(`post-tool-use settings hook output=${text.slice(0, 100)}`);
-				pi.sendUserMessage(text, { deliverAs: "followUp" });
+				queueHookPrompt(text);
 			}
 		}
 	});
 
 	// --- agent-stop ---------------------------------------------------------
 	pi.on("agent_end", async (_event, ctx) => {
-		if (!hooksEnabled) return;
+		if (!hooksEnabled) {
+			pendingHookPrompts = [];
+			return;
+		}
 
 		const scripts = getHookScripts("agent-stop", ctx.cwd);
 		const settingsHooks = getSettingsHooksForEvent("agent-stop", undefined, ctx.cwd);
 
-		if (scripts.length === 0 && settingsHooks.length === 0) return;
-
-		logHook(`agent-stop dir_scripts=${scripts.length} settings_hooks=${settingsHooks.length} stop_hook_active=${stopHookActive}`);
+		if (scripts.length > 0 || settingsHooks.length > 0) {
+			logHook(`agent-stop dir_scripts=${scripts.length} settings_hooks=${settingsHooks.length} stop_hook_active=${stopHookActive}`);
+		}
 
 		// Capture and reset before running scripts so any re-trigger this turn
 		// reflects the current state, not a stale value from the previous run.
@@ -1027,7 +1079,7 @@ export default function (pi: ExtensionAPI) {
 				const msg = result.stderr.trim() || "Hook error";
 				logHook(`agent-stop dir script=${basename(script)} blocked: ${msg.slice(0, 100)}`);
 				stopHookActive = true;
-				pi.sendUserMessage(msg, { deliverAs: "followUp" });
+				queueHookPrompt(msg);
 				continue;
 			}
 
@@ -1042,7 +1094,7 @@ export default function (pi: ExtensionAPI) {
 			if (text) {
 				logHook(`agent-stop dir script=${basename(script)} output=${text.slice(0, 100)}`);
 				stopHookActive = true;
-				pi.sendUserMessage(text, { deliverAs: "followUp" });
+				queueHookPrompt(text);
 			}
 		}
 
@@ -1057,7 +1109,7 @@ export default function (pi: ExtensionAPI) {
 				const msg = result.stderr.trim() || "Hook error";
 				logHook(`agent-stop settings hook blocked: ${msg.slice(0, 100)}`);
 				stopHookActive = true;
-				pi.sendUserMessage(msg, { deliverAs: "followUp" });
+				queueHookPrompt(msg);
 				continue;
 			}
 
@@ -1072,8 +1124,10 @@ export default function (pi: ExtensionAPI) {
 			if (text) {
 				logHook(`agent-stop settings hook output=${text.slice(0, 100)}`);
 				stopHookActive = true;
-				pi.sendUserMessage(text, { deliverAs: "followUp" });
+				queueHookPrompt(text);
 			}
 		}
+
+		flushHookPrompts();
 	});
 }
